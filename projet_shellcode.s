@@ -1,44 +1,57 @@
 section .data
-fichier db "hello_world.txt", 0  ; Nom du fichier qu'on veut ouvrir
+    magic_bytes db 0x7F, "ELF"    ; Signature ELF standard
+    err_msg db "Ce n'est pas un fichier ELF valide", 10
+    err_len equ $ - err_msg
+    ok_msg db "Fichier ELF valide trouvé", 10  
+    ok_len equ $ - ok_msg
 
 section .bss
-fd resq 1                 ; Variable pour stocker le numéro du fichier
-buffer resb 256           ; Mémoire pour stocker les données lues
+    header resb 16    ; Espace pour lire l'en-tête ELF
 
 section .text
-global _start             ; Début du programme
+global _start
 
 _start:
-    ; Ouvrir le fichier
-	mov rax, 2             ; Appel système pour "ouvrir un fichier"
-	lea rdi, [fichier]     ; Le nom du fichier à ouvrir
-	mov rsi, 2             ; Mode lecture seule
-	xor rdx, rdx           ; Pas besoin d'options supplémentaires
-	syscall                ; On demande au système d'ouvrir le fichier
-	mov [fd], rax          ; On garde le numéro du fichier (retour de l'appel système)
-
-    ; Lire le contenu du fichier
-	mov rax, 0             ; Appel système pour "lire un fichier"
-	mov rdi, [fd]          ; On utilise le fichier qu'on a ouvert
-	lea rsi, [buffer]      ; On mettra ce qu'on lit dans ce buffer
-	mov rdx, 256           ; On veut lire jusqu'à 256 octets
-	syscall                ; Lecture effectuée
-	mov r8, rax            ; On garde combien d'octets ont été lus
-
-    ; Afficher ce qu'on a lu
-	mov rax, 1             ; Appel système pour "écrire des données"
-	mov rdi, 1             ; 1 correspond à la sortie standard
-	lea rsi, [buffer]      ; Ce qu'on veut afficher est dans le buffer
-	mov rdx, r8            ; On affiche juste la quantité qu'on a lue
-	syscall                ; Lancer l'affichage
-
-    ; Fermer le fichier
-	mov rax, 3             ; Appel système pour "fermer un fichier"
-	mov rdi, [fd]          ; Le fichier qu'on avait ouvert
-	syscall                ; On demande au système de le fermer
-
-    ; Quitter le programme
-	mov rax, 60            ; Appel système pour "terminer le programme"
-	xor rdi, rdi           ; On indique qu'il n'y a pas d'erreur (code 0)
-	syscall                ; Fin du programme
-
+    ; Ouvrir et lire l'en-tête du fichier
+    mov rax, 2              ; sys_open
+    pop rdi                 ; Nombre d'arguments
+    pop rdi                 ; Nom du programme
+    pop rdi                 ; Premier argument (nom du fichier)
+    mov rsi, 0             ; O_RDONLY
+    syscall
+    
+    cmp rax, 0
+    jl exit                ; Erreur si descripteur négatif
+    
+    mov rdi, rax           ; Descripteur de fichier
+    mov rax, 0             ; sys_read
+    mov rsi, header        ; Buffer où stocker l'en-tête
+    mov rdx, 16            ; Lire les 16 premiers octets
+    syscall
+    
+    ; Vérifier la signature ELF
+    mov rsi, header
+    mov rdi, magic_bytes
+    mov rcx, 4             ; Comparer les 4 octets
+    repe cmpsb             ; Instruction assembleur qui compare octet de rsi et de rdi
+    jne not_elf
+    
+    ; C'est un fichier ELF valide
+    mov rax, 1             ; sys_write
+    mov rdi, 1             ; stdout
+    mov rsi, ok_msg  
+    mov rdx, ok_len
+    syscall
+    jmp exit
+    
+not_elf:
+    mov rax, 1             ; sys_write
+    mov rdi, 1             ; stdout
+    mov rsi, err_msg
+    mov rdx, err_len
+    syscall
+    
+exit:
+    mov rax, 60            ; sys_exit
+    xor rdi, rdi           ; code 0
+    syscall
