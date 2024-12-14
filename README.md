@@ -15,13 +15,7 @@ C'est un petit programme qui peut modifier des fichiers ELF (les exécutables Li
 
 ## Pour l'installer
 
-1. D'abord, clonez le projet :
-```bash
-git clone <lien_du_projet>
-cd <dossier_du_projet>
-```
-
-2. Compilez l'infecteur avec ces commandes :
+Compilez l'infecteur avec ces commandes :
 ```bash
 nasm -f elf64 projet_shellcode.s -o projet_shellcode.o
 ld projet_shellcode.o -o projet_shellcode
@@ -47,33 +41,10 @@ Lancez simplement le fichier infecté :
 ```
 Vous devriez voir une petite surprise s'afficher avant que le programme fonctionne normalement 😉
 
-### Pour voir ce qui a changé
-Utilisez `readelf` pour voir les modifications dans le fichier :
-```bash
-readelf -l mon_ls
-```
-
 ## Trucs à savoir
 
 - Ça marche que sur Linux (testé sur x86_64)
 - Les fichiers doivent être au format ELF (pas de .exe Windows !)
-
-## Petit exemple complet
-
-1. On prépare un fichier à infecter :
-```bash
-cp /bin/ls mon_ls
-```
-
-2. On infecte le fichier :
-```bash
-./projet_shellcode mon_ls
-```
-
-3. On teste :
-```bash
-./mon_ls  # Vous devriez voir le payload avant la liste des fichiers
-```
 
 ## Comment ça marche ?
 
@@ -82,6 +53,6 @@ Le programme modifie le fichier ELF en :
 2. Modifiant le point d'entrée pour exécuter notre code d'abord
 3. Retournant au programme original ensuite
 
-## Auteur et licence
+## Auteur
 
-Fait par Hashif BATCHA pendant mes études. C'est un projet pour apprendre, pas pour faire des bêtises ! 
+Fait par Hashif BATCHA. 
