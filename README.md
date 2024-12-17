@@ -2,12 +2,6 @@
 
 Projet réalisé dans le cadre du cours de sécurité shellcode. L'objectif était de créer un infecteur de fichiers ELF basique pour comprendre les techniques d'injection de shellcode et la manipulation des binaires sous Linux.
 
-⚠️ **Important** : Ce projet est uniquement éducatif ! Ne l'utilisez pas pour faire n'importe quoi.
-
-## C'est quoi au juste ?
-
-C'est un petit programme qui peut modifier des fichiers ELF (les exécutables Linux, comme les .exe sous Windows) pour y ajouter du code tout en faisant en sorte que le programme continue de marcher normalement. 
-
 ## Ce qu'il peut faire
 
 - Infecter un seul fichier
@@ -41,18 +35,9 @@ Lancez simplement le fichier infecté :
 ```
 Vous devriez voir une petite surprise s'afficher avant que le programme fonctionne normalement 😉
 
-## Trucs à savoir
-
-- Ça marche que sur Linux (testé sur x86_64)
-- Les fichiers doivent être au format ELF (pas de .exe Windows !)
-
 ## Comment ça marche ?
 
 Le programme modifie le fichier ELF en :
 1. Ajoutant une nouvelle section pour notre code
 2. Modifiant le point d'entrée pour exécuter notre code d'abord
 3. Retournant au programme original ensuite
-
-## Auteur
-
-Fait par Hashif BATCHA. 
